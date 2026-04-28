@@ -1,73 +1,76 @@
 import asyncio
-import websockets
-import json
 import os
+import json
 from aiohttp import web
+import websockets
+from websockets.asyncio.server import serve
 
-# --- MEMORY STORAGE ---
+# --- DATA STORAGE ---
 connected_clients = set()
-current_task = {"url": ""}  # Stores the camera URL set by users
+current_task = {"url": ""}
 
-# --- 1. WEBSOCKET HANDLER (For Dashboard) ---
+# --- HTTP HANDLERS ---
+async def get_task(request):
+    return web.json_response(current_task)
+
+async def push_alert(request):
+    try:
+        data = await request.json()
+        message = json.dumps(data)
+        # Broadcast the alert to all connected Dashboards
+        if connected_clients:
+            await asyncio.gather(
+                *[client.send(message) for client in connected_clients],
+                return_exceptions=True
+            )
+        return web.Response(text="Alert Sent")
+    except Exception as e:
+        return web.Response(text=str(e), status=400)
+
+# --- WEBSOCKET HANDLER ---
 async def ws_handler(websocket):
     connected_clients.add(websocket)
-    print(f"[+] NODE JOINED. ACTIVE: {len(connected_clients)}")
+    print(f"[+] Dashboard Linked. Total: {len(connected_clients)}")
     try:
         async for message in websocket:
-            # If dashboard sends a START command, update the task URL
             data = json.loads(message)
+            # When user clicks 'Initialize' on Dashboard
             if data.get("command") == "START":
                 current_task["url"] = data.get("url")
-                print(f"[*] Task Updated: {current_task['url']}")
-
-            # Broadcast message to everyone else
-            if connected_clients:
-                await asyncio.gather(
-                    *[client.send(message) for client in connected_clients if client != websocket],
-                    return_exceptions=True
-                )
+                print(f"[*] New Task Set: {current_task['url']}")
+            
+            # General broadcast
+            for client in connected_clients:
+                if client != websocket:
+                    await client.send(message)
     except Exception:
         pass
     finally:
         connected_clients.remove(websocket)
-        print(f"[-] NODE LEFT. ACTIVE: {len(connected_clients)}")
+        print(f"[-] Dashboard Unlinked. Total: {len(connected_clients)}")
 
-# --- 2. HTTP ROUTES (For Hugging Face AI Polling) ---
-async def get_task(request):
-    """AI Node calls this to ask: What should I watch?"""
-    return web.json_response(current_task)
-
-async def push_alert(request):
-    """AI Node calls this to send a snapshot"""
-    data = await request.json()
-    # Relay the alert to all WebSocket clients (the Dashboard)
-    message = json.dumps(data)
-    for client in connected_clients:
-        await client.send(message)
-    print("🚨 Alert pushed to Dashboard")
-    return web.Response(text="OK")
-
-# --- 3. SERVER STARTUP ---
+# --- STARTUP ---
 async def main():
     port = int(os.environ.get("PORT", 8765))
     
-    # Setup HTTP Server
+    # 1. Setup the HTTP App
     app = web.Application()
     app.router.add_get('/get-task', get_task)
     app.router.add_post('/push-alert', push_alert)
     
-    # Setup WebSocket Server
-    ws_server = websockets.serve(ws_handler, "0.0.0.0", port, max_size=10**7)
-
-    print(f"🟢 PANDORA HYBRID ROUTER ONLINE [PORT {port}]")
-    
-    # Run both HTTP and WS together
+    # 2. Start HTTP Server
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080) # HTTP on 8080 or same port if configured
-    
-    await asyncio.gather(ws_server, site.start())
-    await asyncio.Future()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+    # 3. Start WebSocket Server on the SAME port is tricky on Render, 
+    # so we usually run them on the same event loop.
+    # Note: Render works best if you use a library like 'aiohttp' for BOTH.
+    # For now, let's keep it simple: 
+    async with serve(ws_handler, "0.0.0.0", 8765): # Use a different internal port
+        print(f"🟢 PANDORA HYBRID ROUTER LIVE")
+        await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
     asyncio.run(main())
